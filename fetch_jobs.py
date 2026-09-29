@@ -1,7 +1,9 @@
 """Phase 2 for NUworks: pull every job in the "Jobs I Qualify For" list for review.
 
 Run from this folder with `uv run python fetch_jobs.py`. Reuses the browser
-profile in ./user_data and asks you to log in only if the session has expired.
+profile in ./user_data. If the session has expired it signs in through
+Northeastern SSO on its own and stops for you only when a page asks for a
+username, password or Duo. It never fills in or submits a login form.
 Writes jobs_for_review.md and jobs.csv, and only after every request succeeded.
 
 The authorization header is copied from the app's own job list request and sent
@@ -32,6 +34,11 @@ DETAIL_URL = HOST + "/api/v3/jobs/{job_id}?ocr=f"
 POSTING_URL = HOST + "/students/app/jobs/search?perPage=20&page=1&sort=!postdate&ocr=f&currentJobId={job_id}"
 KEEP_HEADERS = ("authorization", "x-requested-system-user")
 HEADER_TIMEOUT_MS = 20_000
+NUWORKS_HOST = urlsplit(HOST).hostname
+SSO_BUTTON = "Current Students and Alumni"
+SSO_TIMEOUT_MS = 30_000
+# Boxes a person types a username or password into. Hidden inputs, like the IdP's auto-submit form, don't match.
+PERSON_INPUTS = "input[type=password], input[type=email], input[type=text], input:not([type])"
 REQUEST_DELAY = 1.0
 MULTIPLE_LOCATIONS = "Multiple Locations"
 MD_PATH = "jobs_for_review.md"
@@ -40,9 +47,10 @@ FIELDS = ("title", "employer", "visual_id", "job_id", "location", "remote_onsite
           "deadline", "compensation_from", "compensation_to", "compensation_frequency", "url", "description")
 BLOCK_TAGS = {"p", "div", "ul", "ol", "table", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}
 
+SSO_MSG = "Session expired. Signing in through Northeastern SSO..."
 LOGIN_PROMPT = """
-Your NUworks session is not active. Log in using the browser window:
-  1. Click "Current Students and Alumni".
+The sign-in needs you. Finish it in the browser window:
+  1. If the NUworks login page is still showing, click "Current Students and Alumni".
   2. Finish Northeastern SSO and Duo.
   3. Do NOT type into the NUworks password box. This script never needs your password.
 Press Enter here once the NUworks student home page is showing."""
@@ -128,13 +136,64 @@ def capture_headers(page):
     return {k: headers[k] for k in KEEP_HEADERS if k in headers}
 
 
+def _host(url):
+    return urlsplit(url).hostname or ""
+
+
+def needs_person(page):
+    """True if the page shows Duo or a visible username or password box. Only reads the page."""
+    try:
+        hosts = [_host(frame.url) for frame in page.frames]
+        if any(h == "duosecurity.com" or h.endswith(".duosecurity.com") for h in hosts):
+            return True
+        return page.locator(PERSON_INPUTS).filter(visible=True).count() > 0
+    except Error:
+        # The page navigated mid-check. The next poll looks again.
+        return False
+
+
+def sso_login(page):
+    """Click SSO_BUTTON on the NUworks login page and follow the redirects. True once back on NUworks.
+
+    False as soon as a page asks for a person, and on a timeout or any Playwright error.
+    The click on the login page is the only input this makes.
+    """
+    print(SSO_MSG)
+    try:
+        page.goto(LOGIN_URL)
+        if _host(page.url) != NUWORKS_HOST:
+            return False
+        before = page.url
+        # The click already waits for the navigation it starts to commit, so it needs the full SSO timeout.
+        page.get_by_role("button", name=SSO_BUTTON, exact=True).click(timeout=SSO_TIMEOUT_MS)
+        # Covers a navigation the click didn't wait for, and keeps the unchanged login page from counting as done.
+        # Not "off NUworks": with a live SP session, /sso/ can redirect straight back without leaving the host.
+        page.wait_for_url(lambda url: url != before, wait_until="commit", timeout=SSO_TIMEOUT_MS)
+        for _ in range(SSO_TIMEOUT_MS // 300):
+            # Host first, so a password box on a NUworks page never counts as a login prompt.
+            if _host(page.url) == NUWORKS_HOST:
+                page.wait_for_load_state()
+                return True
+            if needs_person(page):
+                return False
+            page.wait_for_timeout(300)
+    except Error:
+        # Closed tab, missing button, timeout or interrupted navigation. The manual prompt covers each one.
+        return False
+    # Timed out on a page it can't classify, like a consent screen.
+    return False
+
+
 def get_headers(page):
-    """Headers for our API calls. Asks for one manual login if the session has expired."""
+    """Headers for our API calls. On an expired session, tries SSO first, then asks for one manual login."""
     headers = capture_headers(page)
     if headers is None:
-        page.goto(LOGIN_URL)
-        wait_for_enter(page, LOGIN_PROMPT, script="fetch_jobs.py")
-        headers = capture_headers(page)
+        if sso_login(page):
+            headers = capture_headers(page)
+        # Back on NUworks without a session still gets the manual login.
+        if headers is None:
+            wait_for_enter(page, LOGIN_PROMPT, script="fetch_jobs.py")
+            headers = capture_headers(page)
     if headers is None:
         sys.exit(NO_HEADERS_MSG)
     return headers

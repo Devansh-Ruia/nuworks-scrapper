@@ -305,10 +305,30 @@ class FakeExpect:
         return False
 
 
+# "sentinel" marks what must never be printed. Real IdP and Duo URLs carry session ids and SAML requests.
+IDP_URL = ("https://neuidmsso.neu.edu/idp/profile/SAML2/Redirect/SSO;jsessionid=sentinel-jsid"
+           "?SAMLRequest=sentinel-saml&execution=e1s1")
+DUO_URL = "https://api-x.duosecurity.com/frame/v4/auth/prompt?sid=sentinel-duo-sid"
+# Playwright call logs quote the URLs they navigated to.
+CALL_LOG = f'\nCall log:\n  - navigated to "{IDP_URL}"'
+# Pages after the SSO click, as (url, visible username/password boxes, child frame urls).
+LOADING = (IDP_URL, 0, [])
+PASSWORD = (IDP_URL, 2, [])
+HOME = (HOST + "/students/", 0, [])
+
+
 class FakePage:
-    def __init__(self, logged_in=True, app_status=200):
+    """Has no fill, type, press, check or keyboard, so any attempt to use them fails the test."""
+
+    def __init__(self, logged_in=True, app_status=200, steps=(), login_url=fetch_jobs.LOGIN_URL, button=True):
         self.logged_in, self.app_status = logged_in, app_status
-        self.visited, self.sent = [], []
+        self.steps, self.login_url, self.button = list(steps), login_url, button
+        self.visited, self.sent, self.clicks, self.waits = [], [], [], []
+        self.url, self.inputs, self.frame_urls = "about:blank", 0, []
+
+    @property
+    def frames(self):
+        return [SimpleNamespace(url=url) for url in (self.url, *self.frame_urls)]
 
     def expect_request(self, predicate, timeout=None):
         return FakeExpect(self, predicate)
@@ -316,14 +336,77 @@ class FakePage:
     def goto(self, url):
         self.visited.append(url)
         self.sent = []
+        self.url = self.login_url if url == fetch_jobs.LOGIN_URL else url
         if url == fetch_jobs.SEARCH_URL and self.logged_in:
             # The SPA's other list request, without ocr=f, must not be picked.
             self.sent = [FakeAppRequest(HOST + "/api/v2/jobs?json_mode=read_only&enable_translation=false",
                                         dict(APP_HEADERS, authorization="wrong-list")),
                          FakeAppRequest(LIST_URL, APP_HEADERS, self.app_status)]
 
+    def get_by_role(self, role, name, exact=None):
+        return SimpleNamespace(click=lambda timeout: self._click(role, name, exact))
+
+    def _click(self, role, name, exact):
+        # AssertionError, not Error, so sso_login can't swallow it.
+        assert fetch_jobs._host(self.url) == fetch_jobs.NUWORKS_HOST, "clicked off NUworks"
+        self.clicks.append((role, name, exact))
+        if not self.button:
+            raise PlaywrightTimeoutError("Timeout 30000ms exceeded waiting for get_by_role" + CALL_LOG)
+
+    def wait_for_url(self, predicate, wait_until, timeout):
+        # The click's navigation lands here, so code that skips this wait still sees the login page.
+        self._next()
+        if not predicate(self.url):
+            raise PlaywrightTimeoutError("Timeout 30000ms exceeded waiting for navigation" + CALL_LOG)
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+        self._next()
+
+    def wait_for_load_state(self):
+        pass
+
+    def locator(self, selector):
+        return SimpleNamespace(filter=lambda visible: SimpleNamespace(count=self._count))
+
+    def _count(self):
+        if isinstance(self.inputs, Exception):
+            raise self.inputs
+        return self.inputs
+
+    def _next(self):
+        # Stays on the last step once the list runs out.
+        self.url, self.inputs, self.frame_urls = self.steps.pop(0) if len(self.steps) > 1 else self.steps[0]
+        # Any NUworks page but the login page means SSO gave NUworks a session.
+        if fetch_jobs._host(self.url) == fetch_jobs.NUWORKS_HOST and self.url != fetch_jobs.LOGIN_URL:
+            self.logged_in = True
+
+
+def log_in(page, prompt, script):
+    page.logged_in = True
+
 
 class GetHeadersTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch("builtins.print")
+        self.printed = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        printed = [str(arg) for c in self.printed.call_args_list for arg in (*c.args, *c.kwargs.values())]
+        self.assertFalse([p for p in printed if "sentinel" in p], "a URL, error or header was printed")
+
+    def get_headers(self, page):
+        with mock.patch("fetch_jobs.wait_for_enter", side_effect=log_in) as self.prompt:
+            return fetch_jobs.get_headers(page)
+
+    def assert_prompted(self, page):
+        self.prompt.assert_called_once_with(page, fetch_jobs.LOGIN_PROMPT, script="fetch_jobs.py")
+
+    def assert_stopped_on_sight(self, page):
+        # One poll on the first page, then the next page is recognized. The timeout would also end in a prompt.
+        self.assertEqual(page.waits, [300])
+
     def test_keeps_only_auth_headers_from_the_ocr_request(self):
         self.assertEqual(fetch_jobs.capture_headers(FakePage()), AUTH_HEADERS)
 
@@ -334,16 +417,77 @@ class GetHeadersTest(unittest.TestCase):
         page.goto = mock.Mock(side_effect=Error("Navigation is interrupted by another navigation"))
         self.assertIsNone(fetch_jobs.capture_headers(page))
 
-    def test_login_then_retry(self):
-        page = FakePage(logged_in=False)
-        with mock.patch("fetch_jobs.wait_for_enter", side_effect=lambda p, prompt, script: setattr(p, "logged_in", True)) as w:
-            self.assertEqual(fetch_jobs.get_headers(page), AUTH_HEADERS)
+    def test_sso_session_valid_needs_no_prompt(self):
+        page = FakePage(logged_in=False, steps=[LOADING, HOME])
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.prompt.assert_not_called()
         self.assertEqual(page.visited, [fetch_jobs.SEARCH_URL, fetch_jobs.LOGIN_URL, fetch_jobs.SEARCH_URL])
-        self.assertIn("Current Students and Alumni", w.call_args.args[1])
-        self.assertEqual(w.call_args.kwargs["script"], "fetch_jobs.py")
+        self.assertEqual(page.clicks, [("button", "Current Students and Alumni", True)])
+        self.assertEqual(self.printed.call_args_list, [mock.call(fetch_jobs.SSO_MSG)])
+
+    def test_sp_session_valid_redirects_straight_home(self):
+        # /sso/ can 302 back to NUworks without any page off the host.
+        page = FakePage(logged_in=False, steps=[HOME])
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.prompt.assert_not_called()
+
+    def test_back_on_login_page_prompts(self):
+        page = FakePage(logged_in=False, steps=[LOADING, (fetch_jobs.LOGIN_URL, 2, [])])
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.assert_prompted(page)
+        self.assertEqual(page.visited, [fetch_jobs.SEARCH_URL, fetch_jobs.LOGIN_URL, fetch_jobs.SEARCH_URL,
+                                        fetch_jobs.SEARCH_URL])
+
+    def test_nuworks_password_box_after_return_is_not_a_prompt(self):
+        page = FakePage(logged_in=False, steps=[LOADING, (HOST + "/students/", 2, [])])
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.prompt.assert_not_called()
+
+    def test_login_then_retry(self):
+        page = FakePage(logged_in=False, steps=[LOADING, PASSWORD])
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.assert_prompted(page)
+        self.assert_stopped_on_sight(page)
+        self.assertIn("Current Students and Alumni", fetch_jobs.LOGIN_PROMPT)
+        # No navigation after the password page, so the user keeps their place.
+        self.assertEqual(page.visited, [fetch_jobs.SEARCH_URL, fetch_jobs.LOGIN_URL, fetch_jobs.SEARCH_URL])
+        self.assertEqual(len(page.clicks), 1)
+
+    def test_duo_prompts(self):
+        for step in ((IDP_URL, 0, [DUO_URL]), (DUO_URL, 0, [])):
+            with self.subTest(step=step):
+                page = FakePage(logged_in=False, steps=[LOADING, step])
+                self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+                self.assert_prompted(page)
+                self.assert_stopped_on_sight(page)
+
+    def test_missing_button_prompts(self):
+        page = FakePage(logged_in=False, button=False)
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.assert_prompted(page)
+
+    def test_login_url_off_nuworks_prompts_without_clicking(self):
+        page = FakePage(logged_in=False, login_url=IDP_URL)
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.assert_prompted(page)
+        self.assertEqual(page.clicks, [])
+
+    def test_unclassifiable_page_prompts_after_timeout(self):
+        page = FakePage(logged_in=False, steps=[LOADING])
+        with mock.patch.object(fetch_jobs, "SSO_TIMEOUT_MS", 900):
+            self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.assert_prompted(page)
+        self.assertEqual(page.waits, [300] * 3)
+
+    def test_navigation_error_mid_check_retries_next_poll(self):
+        destroyed = Error("Execution context was destroyed, most likely because of a navigation" + CALL_LOG)
+        page = FakePage(logged_in=False, steps=[(IDP_URL, destroyed, []), PASSWORD])
+        self.assertEqual(self.get_headers(page), AUTH_HEADERS)
+        self.assert_prompted(page)
+        self.assert_stopped_on_sight(page)
 
     def test_still_logged_out_exits(self):
-        page = FakePage(logged_in=False)
+        page = FakePage(logged_in=False, steps=[LOADING, PASSWORD])
         with mock.patch("fetch_jobs.wait_for_enter"):
             with self.assertRaises(SystemExit) as cm:
                 fetch_jobs.get_headers(page)
