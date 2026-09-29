@@ -273,19 +273,21 @@ class WaitForEnterTest(unittest.TestCase):
 
         with mock.patch("builtins.input", side_effect=blocking_input), mock.patch("builtins.print"):
             with self.assertRaises(SystemExit) as cm:
-                recon.wait_for_enter(FakePage(closed=True), "go")
+                recon.wait_for_enter(FakePage(closed=True), "go", script="fetch_jobs.py")
             # Keep the patch until the reader thread is inside the fake input, so it never reaches the real one.
             self.assertTrue(entered.wait(2))
             release.set()
         self.assertIn("closed", str(cm.exception))
+        self.assertIn("Run fetch_jobs.py again", str(cm.exception))
 
     def test_input_failure_exits(self):
         for exc in (EOFError, OSError):
             with self.subTest(exc=exc.__name__):
                 with mock.patch("builtins.input", side_effect=exc), mock.patch("builtins.print"):
                     with self.assertRaises(SystemExit) as cm:
-                        recon.wait_for_enter(FakePage(), "go")
+                        recon.wait_for_enter(FakePage(), "go", script="fetch_jobs.py")
                 self.assertIn("interactive terminal", str(cm.exception))
+                self.assertIn("Run fetch_jobs.py from", str(cm.exception))
 
 
 if __name__ == "__main__":

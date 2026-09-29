@@ -56,8 +56,8 @@ Step 2 of 2: recording NUworks traffic now
   4. Keep this first tab open.
 Press Enter here when done."""
 
-CLOSED_MSG = "The browser tab was closed before Enter was pressed. No HAR was written. Run recon.py again."
-EOF_MSG = "Could not read terminal input. Run recon.py from an interactive terminal."
+CLOSED_MSG = "The browser tab was closed before Enter was pressed. Nothing was written. Run {script} again."
+EOF_MSG = "Could not read terminal input. Run {script} from an interactive terminal."
 
 
 def _hash(value):
@@ -205,7 +205,7 @@ def cookie_table(cookies):
     return f"Cookies ({len(cookies)}, values never stored):\n{table}"
 
 
-def wait_for_enter(page, prompt):
+def wait_for_enter(page, prompt, script="recon.py"):
     """Block until Enter while keeping Playwright events flowing. A bare input() would stall them."""
     print(prompt)
     done = threading.Event()
@@ -222,15 +222,15 @@ def wait_for_enter(page, prompt):
     threading.Thread(target=read, daemon=True).start()
     while not done.is_set():
         if page.is_closed():
-            sys.exit(CLOSED_MSG)
+            sys.exit(CLOSED_MSG.format(script=script))
         try:
             page.wait_for_timeout(300)
         except Error:
             if page.is_closed():
-                sys.exit(CLOSED_MSG)
+                sys.exit(CLOSED_MSG.format(script=script))
             raise
     if state.get("failed"):
-        sys.exit(EOF_MSG)
+        sys.exit(EOF_MSG.format(script=script))
 
 
 def main():

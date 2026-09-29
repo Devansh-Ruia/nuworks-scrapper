@@ -6,3 +6,4 @@ recon_summary.txt
 *.csv
 .venv/
 __pycache__/
+jobs_for_review.md
