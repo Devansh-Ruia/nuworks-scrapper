@@ -1,21 +1,26 @@
-"""Phase 2 for NUworks: pull every job in the "Jobs I Qualify For" list for review.
+"""Phase 2 for NUworks: pull every job in a NUworks job list for review, with its qualified status.
 
-Run from this folder with `uv run python fetch_jobs.py`. Reuses the browser
-profile in ./user_data. If the session has expired it signs in through
-Northeastern SSO on its own and stops for you only when a page asks for a
-username, password or Duo. It never fills in or submits a login form.
+Run from this folder with `uv run python fetch_jobs.py` for the "Jobs I Qualify For"
+list, or `uv run python fetch_jobs.py --coop` for "All Job Listings" filtered to
+Position Type Co-op. Reuses the browser profile in ./user_data. If the session
+has expired it signs in through Northeastern SSO on its own and stops for you
+only when a page asks for a username, password or Duo. It never fills in or
+submits a login form.
 Writes jobs_for_review.md and jobs.csv, and only after every request succeeded.
+Both modes write the same two files, so each run replaces the last one's output.
 
 The authorization header is copied from the app's own job list request and sent
 back with ours. Its value is never printed, logged or written to disk.
 """
 
+import argparse
 import csv
 import json
 import math
 import re
 import sys
 import time
+from collections import namedtuple
 from datetime import datetime
 from functools import partial
 from html.parser import HTMLParser
@@ -29,9 +34,22 @@ from recon import LOGIN_URL, wait_for_enter
 HOST = "https://northeastern-csm.symplicity.com"
 SEARCH_URL = HOST + "/students/app/jobs/search?ocr=f"
 LIST_URL = HOST + "/api/v2/jobs?ocr=f&json_mode=read_only&enable_translation=false"
-DETAIL_URL = HOST + "/api/v3/jobs/{job_id}?ocr=f"
-# Verbatim from a Referer in recon.har. Only currentJobId changes.
-POSTING_URL = HOST + "/students/app/jobs/search?perPage=20&page=1&sort=!postdate&ocr=f&currentJobId={job_id}"
+# In the /api/v2/jobs/filters/students response in recon.har, ocr id c is "All Job Listings" and
+# job_type id 5 is "Co-op". recon.har has no request with a filter applied, so the job_type=5 shape
+# is not proven. fetch_models guards it by checking the job_type of every model it gets back.
+COOP_LIST_URL = HOST + "/api/v2/jobs?ocr=c&job_type=5&json_mode=read_only&enable_translation=false"
+# The SPA sends the list's ocr on detail calls. recon.har only has ocr=f ones.
+DETAIL_URL = HOST + "/api/v3/jobs/{job_id}?ocr={ocr}"
+# Verbatim from a Referer in recon.har, where ocr was f. Only ocr and currentJobId change.
+POSTING_URL = HOST + "/students/app/jobs/search?perPage=20&page=1&sort=!postdate&ocr={ocr}&currentJobId={job_id}"
+# Verbatim from recon.har, double slash included. The SPA sent up to 40 job_ids per call.
+QUALIFIED_URL = HOST + "/api/v2//jobs/discovery/qualified-status?jobs={ids}"
+QUALIFIED_BATCH = 40
+NOT_RETURNED = "not returned"
+# job_type is the label the list models carry, like ["Co-op"]. None means no filter to check.
+Mode = namedtuple("Mode", "name ocr list_url job_type")
+QUALIFY = Mode("Jobs I Qualify For", "f", LIST_URL, None)
+COOP = Mode("All Job Listings", "c", COOP_LIST_URL, "Co-op")
 KEEP_HEADERS = ("authorization", "x-requested-system-user")
 HEADER_TIMEOUT_MS = 20_000
 NUWORKS_HOST = urlsplit(HOST).hostname
@@ -43,8 +61,9 @@ REQUEST_DELAY = 1.0
 MULTIPLE_LOCATIONS = "Multiple Locations"
 MD_PATH = "jobs_for_review.md"
 CSV_PATH = "jobs.csv"
-FIELDS = ("title", "employer", "visual_id", "job_id", "location", "remote_onsite", "job_start", "job_end",
-          "deadline", "compensation_from", "compensation_to", "compensation_frequency", "url", "description")
+FIELDS = ("title", "employer", "visual_id", "job_id", "qualified", "location", "remote_onsite", "job_start",
+          "job_end", "deadline", "compensation_from", "compensation_to", "compensation_frequency", "url",
+          "description")
 BLOCK_TAGS = {"p", "div", "ul", "ol", "table", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}
 
 SSO_MSG = "Session expired. Signing in through Northeastern SSO..."
@@ -59,6 +78,14 @@ NO_HEADERS_MSG = ("Could not capture the job list request from the NUworks searc
                   "logging in. Check that the student home page loads, then run fetch_jobs.py again.")
 PAGE_PARAM_MSG = ("The page param did not work: the request with &page=2 did not return page 2 with "
                   "new jobs. Stopping before the full fetch. No output files were written.")
+JOB_TYPE_MSG = ("The job_type filter did not work: {wrong} of {count} jobs on list page {page} are not "
+                "{job_type}. Stopping before any more requests. No output files were written. Run recon.py, "
+                "pick the filter in the UI and read the real param from the new recon.har.")
+QUALIFIED_MSG = ("The qualified-status response for {url} had no map of job_id to status. Stopping before "
+                 "the output is written. No output files were written.")
+BLANK_NOTE = ("Qualified status is the raw value from NUworks' qualified-status endpoint. (blank) means an "
+              "empty value, which every Jobs I Qualify For job checked in recon.har had. \"not returned\" means "
+              "the endpoint left that job out of its response.")
 
 
 class _TextParser(HTMLParser):
@@ -220,18 +247,27 @@ def fetch_json(request_context, url, headers):
         sys.exit(f"Response was not JSON (HTTP {response.status}) for {url}. The session may have expired.")
 
 
-def fetch_models(fetch):
+def fetch_models(fetch, list_url=LIST_URL, job_type=None):
     """All list models, deduped by job_id in API order, plus a note on the page-2 check.
 
     The browser never sent a page param, so &page=2 is tested once before looping over the rest.
+    With job_type set, each page is checked as it arrives and any model without that label stops the run.
     """
-    first = fetch(LIST_URL)
+    def get(n):
+        data = fetch(list_url if n == 1 else f"{list_url}&page={n}")
+        if job_type:
+            wrong = sum(job_type not in (m.get("job_type") or []) for m in data["models"])
+            if wrong:
+                sys.exit(JOB_TYPE_MSG.format(wrong=wrong, count=len(data["models"]), page=n, job_type=job_type))
+        return data
+
+    first = get(1)
     per_page, total = first["perPage"], first["total"]
     pages = [first["models"]]
     if total <= per_page:
         note = f"skipped, total {total} fits on one page of {per_page}"
     else:
-        second = fetch(f"{LIST_URL}&page=2")
+        second = get(2)
         first_ids = {m["job_id"] for m in first["models"]}
         second_ids = {m["job_id"] for m in second["models"]}
         # An empty page 2 would pass the overlap test without proving anything.
@@ -240,7 +276,7 @@ def fetch_models(fetch):
         note = "passed, &page=2 returned page 2 with no job_ids from page 1"
         pages.append(second["models"])
         for n in range(3, math.ceil(total / per_page) + 1):
-            models = fetch(f"{LIST_URL}&page={n}")["models"]
+            models = get(n)["models"]
             if not models:
                 break
             pages.append(models)
@@ -252,21 +288,44 @@ def fetch_models(fetch):
     return list(unique.values()), note
 
 
-def resolve_locations(models, fetch):
+def fetch_qualified(job_ids, fetch):
+    """Qualified status per job_id, QUALIFIED_BATCH ids per call. Returns (statuses, calls).
+
+    Exits on a response without a "qualified" map. Ids a good map leaves out get NOT_RETURNED and a printed warning.
+    """
+    returned, calls = {}, 0
+    for start in range(0, len(job_ids), QUALIFIED_BATCH):
+        calls += 1
+        url = QUALIFIED_URL.format(ids=",".join(job_ids[start:start + QUALIFIED_BATCH]))
+        data = fetch(url)
+        qualified = data.get("qualified") if isinstance(data, dict) else None
+        if qualified == []:
+            # PHP encodes an empty map as [].
+            qualified = {}
+        if not isinstance(qualified, dict):
+            sys.exit(QUALIFIED_MSG.format(url=url))
+        returned.update(qualified)
+    missing = sum(job_id not in returned for job_id in job_ids)
+    if missing:
+        print(f"Warning: the qualified-status endpoint did not return {missing} of {len(job_ids)} jobs.")
+    return {job_id: returned.get(job_id, NOT_RETURNED) for job_id in job_ids}, calls
+
+
+def resolve_locations(models, fetch, ocr):
     """Location per model. Only the "Multiple Locations" placeholder costs a detail call. Returns (locations, calls)."""
     locations, calls = [], 0
     for model in models:
         location = model.get("job_location") or ""
         if location == MULTIPLE_LOCATIONS:
             calls += 1
-            detail = fetch(DETAIL_URL.format(job_id=model["job_id"]))
+            detail = fetch(DETAIL_URL.format(job_id=model["job_id"], ocr=ocr))
             addresses = [a.get("address_text") for a in detail.get("location") or []]
             location = "; ".join(filter(None, addresses)) or MULTIPLE_LOCATIONS
         locations.append(location)
     return locations, calls
 
 
-def to_record(model, location):
+def to_record(model, location, qualified, ocr):
     """Flat record with FIELDS as keys, in order."""
     times = model.get("jobs_iso_times") or {}
     return {
@@ -274,6 +333,7 @@ def to_record(model, location):
         "employer": (model.get("name") or "").strip(),
         "visual_id": model.get("visual_id") or "",
         "job_id": model["job_id"],
+        "qualified": qualified,
         "location": location,
         "remote_onsite": (model.get("symp_remote_onsite") or {}).get("label") or "not specified",
         "job_start": times.get("job_start") or "",
@@ -282,7 +342,7 @@ def to_record(model, location):
         "compensation_from": model.get("compensation_from") or "",
         "compensation_to": model.get("compensation_to") or "",
         "compensation_frequency": model.get("compensation_frequency") or "",
-        "url": POSTING_URL.format(job_id=model["job_id"]),
+        "url": POSTING_URL.format(job_id=model["job_id"], ocr=ocr),
         "description": html_to_text(model.get("job_desc")),
     }
 
@@ -300,10 +360,13 @@ def write_csv(records, path):
         writer.writerows(records)
 
 
-def write_markdown(records, path):
+def write_markdown(records, path, mode):
     generated = datetime.now().astimezone().isoformat(timespec="minutes")
-    lines = [f"# Jobs I Qualify For ({len(records)} jobs)", "",
-             f"Source: NUworks Jobs I Qualify For list ({SEARCH_URL}). Generated {generated}.", ""]
+    title = f"{mode.name}, {mode.job_type}" if mode.job_type else mode.name
+    source = f"NUworks {mode.name} list" + (f" filtered to Position Type {mode.job_type}" if mode.job_type else "")
+    lines = [f"# {title} ({len(records)} jobs)", "",
+             f"Source: {source} ({HOST}/students/app/jobs/search?ocr={mode.ocr}). Generated {generated}.", "",
+             BLANK_NOTE, ""]
     for r in records:
         comp = format_compensation(r)
         lines += [
@@ -311,6 +374,7 @@ def write_markdown(records, path):
             f"## {r['title']} at {r['employer']}", "",
             f"- visual_id: {r['visual_id']}",
             f"- job_id: {r['job_id']}",
+            f"- qualified status: {r['qualified'] or '(blank)'}",
             f"- location: {r['location']}",
             f"- remote/onsite: {r['remote_onsite']}",
             f"- job_start: {r['job_start']}",
@@ -324,7 +388,12 @@ def write_markdown(records, path):
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
-def main():
+def main(argv):
+    # argparse, so a typo like --co-op stops with an error instead of quietly running the default list.
+    parser = argparse.ArgumentParser(description="Fetch a NUworks job list for review.")
+    parser.add_argument("--coop", action="store_true",
+                        help='fetch "All Job Listings" filtered to Position Type Co-op instead of "Jobs I Qualify For"')
+    mode = COOP if parser.parse_args(argv).coop else QUALIFY
     # Git Bash pipes stdout, so force line buffering and never crash on odd characters.
     sys.stdout.reconfigure(line_buffering=True, errors="replace")
     with sync_playwright() as p:
@@ -332,18 +401,20 @@ def main():
         page = context.pages[0]
         headers = get_headers(page)
         fetch = partial(fetch_json, context.request, headers=headers)
-        models, page_check = fetch_models(fetch)
-        locations, detail_calls = resolve_locations(models, fetch)
+        models, page_check = fetch_models(fetch, mode.list_url, mode.job_type)
+        locations, detail_calls = resolve_locations(models, fetch, mode.ocr)
+        qualified, qualified_calls = fetch_qualified([m["job_id"] for m in models], fetch)
         context.close()
 
-    records = [to_record(m, loc) for m, loc in zip(models, locations)]
+    records = [to_record(m, loc, qualified[m["job_id"]], mode.ocr) for m, loc in zip(models, locations)]
     write_csv(records, CSV_PATH)
-    write_markdown(records, MD_PATH)
-    print(f"Fetched {len(records)} jobs.")
+    write_markdown(records, MD_PATH, mode)
+    print(f"Fetched {len(records)} jobs from {mode.name}" + (f", {mode.job_type} only." if mode.job_type else "."))
     print(f"Page 2 check: {page_check}.")
     print(f"Detail calls: {detail_calls}, all for the location field of \"{MULTIPLE_LOCATIONS}\" jobs.")
+    print(f"Qualified-status calls: {qualified_calls}, up to {QUALIFIED_BATCH} jobs each.")
     print(f"Wrote {MD_PATH} and {CSV_PATH}.")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
